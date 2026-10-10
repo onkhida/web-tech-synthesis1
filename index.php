@@ -2,22 +2,56 @@
 // AFA Match Center - Public Live Match Scoreboard & Center
 require_once __DIR__ . '/db.php';
 
-// Fetch active live match or latest match
-$match_query = "SELECT m.*, 
-                       th.name AS home_name, th.short_code AS home_code, th.hex_color AS home_color, th.logo_url AS home_logo,
-                       ta.name AS away_name, ta.short_code AS away_code, ta.hex_color AS away_color, ta.logo_url AS away_logo
-                FROM matches m
-                JOIN teams th ON m.home_team_id = th.id
-                JOIN teams ta ON m.away_team_id = ta.id
-                ORDER BY CASE WHEN m.status = 'live' THEN 1 ELSE 2 END, m.id DESC 
-                LIMIT 1";
+// Check if specific match_id requested
+$selected_match_id = isset($_GET['match_id']) ? intval($_GET['match_id']) : 0;
 
-$match_result = $conn->query($match_query);
-$match = $match_result ? $match_result->fetch_assoc() : null;
+if ($selected_match_id > 0) {
+    $match_query = "SELECT m.*, 
+                           th.name AS home_name, th.short_code AS home_code, th.hex_color AS home_color, th.logo_url AS home_logo,
+                           ta.name AS away_name, ta.short_code AS away_code, ta.hex_color AS away_color, ta.logo_url AS away_logo
+                    FROM matches m
+                    JOIN teams th ON m.home_team_id = th.id
+                    JOIN teams ta ON m.away_team_id = ta.id
+                    WHERE m.id = ? LIMIT 1";
+    $stmt = $conn->prepare($match_query);
+    $stmt->bind_param("i", $selected_match_id);
+    $stmt->execute();
+    $match = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+} else {
+    $match_query = "SELECT m.*, 
+                           th.name AS home_name, th.short_code AS home_code, th.hex_color AS home_color, th.logo_url AS home_logo,
+                           ta.name AS away_name, ta.short_code AS away_code, ta.hex_color AS away_color, ta.logo_url AS away_logo
+                    FROM matches m
+                    JOIN teams th ON m.home_team_id = th.id
+                    JOIN teams ta ON m.away_team_id = ta.id
+                    ORDER BY CASE WHEN m.status = 'live' THEN 1 ELSE 2 END, m.id DESC 
+                    LIMIT 1";
+    $match_result = $conn->query($match_query);
+    $match = $match_result ? $match_result->fetch_assoc() : null;
+}
+
+// Fetch list of all matches for switcher
+$all_matches_res = $conn->query("
+    SELECT m.id, m.status, th.short_code AS home_code, ta.short_code AS away_code 
+    FROM matches m 
+    JOIN teams th ON m.home_team_id = th.id 
+    JOIN teams ta ON m.away_team_id = ta.id 
+    ORDER BY m.id DESC
+");
+$all_matches = [];
+while ($am = $all_matches_res->fetch_assoc()) {
+    $all_matches[] = $am;
+}
 
 $event_logs = [];
+$home_lineup = [];
+$away_lineup = [];
+
 if ($match) {
     $match_id = (int)$match['id'];
+
+    // Fetch Event Logs
     $events_stmt = $conn->prepare("
         SELECT e.*, t.name AS team_name, t.short_code AS team_code, t.hex_color AS team_color
         FROM event_logs e
@@ -32,9 +66,29 @@ if ($match) {
         $event_logs[] = $row;
     }
     $events_stmt->close();
+
+    // Fetch Match Starting Lineups (Rosters)
+    $roster_sql = "
+        SELECT mr.*, p.name AS player_name, p.jersey_number, p.position 
+        FROM match_rosters mr
+        JOIN players p ON mr.player_id = p.id
+        WHERE mr.match_id = ?
+        ORDER BY FIELD(p.position, 'GK', 'DEF', 'MID', 'FWD'), p.jersey_number ASC
+    ";
+    $roster_stmt = $conn->prepare($roster_sql);
+    $roster_stmt->bind_param("i", $match_id);
+    $roster_stmt->execute();
+    $roster_res = $roster_stmt->get_result();
+    while ($r = $roster_res->fetch_assoc()) {
+        if ($r['team_id'] == $match['home_team_id']) {
+            $home_lineup[] = $r;
+        } else {
+            $away_lineup[] = $r;
+        }
+    }
+    $roster_stmt->close();
 }
 
-// Function to get display label & icon for events
 function getEventBadge($type) {
     switch ($type) {
         case 'goal':
@@ -63,7 +117,6 @@ function getEventBadge($type) {
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 </head>
 <body>
-    <!-- Top Site Navigation Header -->
     <header class="site-header">
         <div class="header-container">
             <div class="brand-identity">
@@ -74,8 +127,9 @@ function getEventBadge($type) {
                 </div>
             </div>
             <nav class="nav-actions">
+                <a href="admin.php" class="btn btn-secondary"><span class="btn-icon">⚙️</span> Admin Portal</a>
                 <a href="logger.php" class="btn btn-primary" id="nav-logger-btn">
-                    <span class="btn-icon">⚡</span> Go to Official Logger
+                    <span class="btn-icon">⚡</span> Official Logger
                 </a>
             </nav>
         </div>
@@ -84,10 +138,22 @@ function getEventBadge($type) {
     <main class="main-content">
         <?php if (!$match): ?>
             <section class="card empty-state">
-                <h2>No Active Matches Found</h2>
-                <p>There are no matches scheduled or live right now. Please import <code>schema.sql</code> or create a new match in the database.</p>
+                <h2>No Matches Found</h2>
+                <p>There are no matches scheduled or live right now. Go to the <a href="admin.php" style="color:#60a5fa;">Admin Portal</a> to create teams and matches.</p>
             </section>
         <?php else: ?>
+            <!-- Match Switcher -->
+            <div class="match-switcher-bar">
+                <label for="public-match-select">Select Match: </label>
+                <select id="public-match-select" onchange="location.href='index.php?match_id=' + this.value;" class="form-control-xs">
+                    <?php foreach ($all_matches as $am): ?>
+                        <option value="<?php echo (int)$am['id']; ?>" <?php echo $am['id'] == $match['id'] ? 'selected' : ''; ?>>
+                            Match #<?php echo (int)$am['id']; ?>: <?php echo htmlspecialchars($am['home_code']); ?> vs <?php echo htmlspecialchars($am['away_code']); ?> (<?php echo strtoupper($am['status']); ?>)
+                        </option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
+
             <!-- Scoreboard Card Header -->
             <section class="scoreboard-card" id="scoreboard-header">
                 <div class="status-ribbon">
@@ -97,17 +163,14 @@ function getEventBadge($type) {
                 </div>
 
                 <div class="scoreboard-body">
-                    <!-- Home Team -->
                     <div class="team-block home-team">
                         <div class="team-badge" style="--team-color: <?php echo htmlspecialchars($match['home_color']); ?>;">
-                            <span class="color-stripe"></span>
                             <span class="short-code"><?php echo htmlspecialchars($match['home_code']); ?></span>
                         </div>
                         <h2 class="team-name"><?php echo htmlspecialchars($match['home_name']); ?></h2>
                         <span class="team-role">Home</span>
                     </div>
 
-                    <!-- Score display & Clock Ticker -->
                     <div class="score-display">
                         <div class="scores">
                             <span class="score-number" id="home-score-display"><?php echo (int)$match['home_score']; ?></span>
@@ -121,10 +184,8 @@ function getEventBadge($type) {
                         </div>
                     </div>
 
-                    <!-- Away Team -->
                     <div class="team-block away-team">
                         <div class="team-badge" style="--team-color: <?php echo htmlspecialchars($match['away_color']); ?>;">
-                            <span class="color-stripe"></span>
                             <span class="short-code"><?php echo htmlspecialchars($match['away_code']); ?></span>
                         </div>
                         <h2 class="team-name"><?php echo htmlspecialchars($match['away_name']); ?></h2>
@@ -133,17 +194,65 @@ function getEventBadge($type) {
                 </div>
             </section>
 
-            <!-- Grid Layout for SVG Pitch Graphic & Timeline Feed -->
+            <!-- Lineups Section -->
+            <section class="card lineups-card">
+                <div class="card-header">
+                    <h2><span class="header-icon">📋</span> Starting XI Squad Lineups</h2>
+                    <span class="badge badge-info">Match Roster</span>
+                </div>
+
+                <div class="lineups-grid">
+                    <!-- Home Lineup -->
+                    <div class="lineup-column home-lineup">
+                        <h3 class="lineup-team-title" style="border-left: 4px solid <?php echo htmlspecialchars($match['home_color']); ?>;">
+                            <?php echo htmlspecialchars($match['home_name']); ?>
+                        </h3>
+                        <?php if (empty($home_lineup)): ?>
+                            <p class="text-muted font-sm">No squad roster registered yet.</p>
+                        <?php else: ?>
+                            <ul class="lineup-list">
+                                <?php foreach ($home_lineup as $p): ?>
+                                    <li class="lineup-item">
+                                        <span class="jersey-pill">#<?php echo (int)$p['jersey_number']; ?></span>
+                                        <span class="player-name-text"><?php echo htmlspecialchars($p['player_name']); ?></span>
+                                        <span class="pos-badge pos-<?php echo strtolower($p['position']); ?>"><?php echo htmlspecialchars($p['position']); ?></span>
+                                    </li>
+                                <?php endforeach; ?>
+                            </ul>
+                        <?php endif; ?>
+                    </div>
+
+                    <!-- Away Lineup -->
+                    <div class="lineup-column away-lineup">
+                        <h3 class="lineup-team-title" style="border-left: 4px solid <?php echo htmlspecialchars($match['away_color']); ?>;">
+                            <?php echo htmlspecialchars($match['away_name']); ?>
+                        </h3>
+                        <?php if (empty($away_lineup)): ?>
+                            <p class="text-muted font-sm">No squad roster registered yet.</p>
+                        <?php else: ?>
+                            <ul class="lineup-list">
+                                <?php foreach ($away_lineup as $p): ?>
+                                    <li class="lineup-item">
+                                        <span class="jersey-pill">#<?php echo (int)$p['jersey_number']; ?></span>
+                                        <span class="player-name-text"><?php echo htmlspecialchars($p['player_name']); ?></span>
+                                        <span class="pos-badge pos-<?php echo strtolower($p['position']); ?>"><?php echo htmlspecialchars($p['position']); ?></span>
+                                    </li>
+                                <?php endforeach; ?>
+                            </ul>
+                        <?php endif; ?>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Dashboard Grid (Pitch & Timeline) -->
             <div class="dashboard-grid">
-                <!-- SVG Pitch Graphic Container -->
+                <!-- SVG Pitch Graphic -->
                 <section class="card pitch-section">
                     <div class="card-header">
-                        <h2><span class="header-icon">🏟️</span> Live Tactical Pitch Overview</h2>
-                        <span class="badge badge-info">Interactive View</span>
+                        <h2><span class="header-icon">🏟️</span> Live Pitch View</h2>
                     </div>
                     <div class="pitch-container">
                         <svg class="pitch-svg" viewBox="0 0 800 500" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">
-                            <!-- Pitch Turf Background with Stripes -->
                             <defs>
                                 <pattern id="grass-stripes" width="100" height="500" patternUnits="userSpaceOnUse">
                                     <rect x="0" y="0" width="50" height="500" fill="#15803d" />
@@ -155,39 +264,24 @@ function getEventBadge($type) {
                                 </radialGradient>
                             </defs>
                             
-                            <!-- Base Turf -->
                             <rect width="800" height="500" fill="url(#grass-stripes)" rx="16" />
                             <rect width="800" height="500" fill="url(#pitch-glow)" rx="16" />
 
-                            <!-- Boundary Line -->
                             <rect x="30" y="30" width="740" height="440" fill="none" stroke="#ffffff" stroke-width="3" stroke-opacity="0.85" rx="4" />
-
-                            <!-- Halfway Line -->
                             <line x1="400" y1="30" x2="400" y2="470" stroke="#ffffff" stroke-width="3" stroke-opacity="0.85" />
-
-                            <!-- Center Circle -->
                             <circle cx="400" cy="250" r="70" fill="none" stroke="#ffffff" stroke-width="3" stroke-opacity="0.85" />
                             <circle cx="400" cy="250" r="4" fill="#ffffff" />
 
-                            <!-- Left Penalty Area (Home) -->
                             <rect x="30" y="115" width="125" height="270" fill="none" stroke="#ffffff" stroke-width="3" stroke-opacity="0.85" />
                             <rect x="30" y="185" width="45" height="130" fill="none" stroke="#ffffff" stroke-width="3" stroke-opacity="0.85" />
                             <circle cx="120" cy="250" r="3" fill="#ffffff" />
                             <path d="M 155 195 A 70 70 0 0 1 155 305" fill="none" stroke="#ffffff" stroke-width="3" stroke-opacity="0.85" />
 
-                            <!-- Right Penalty Area (Away) -->
                             <rect x="645" y="115" width="125" height="270" fill="none" stroke="#ffffff" stroke-width="3" stroke-opacity="0.85" />
                             <rect x="725" y="185" width="45" height="130" fill="none" stroke="#ffffff" stroke-width="3" stroke-opacity="0.85" />
                             <circle cx="680" cy="250" r="3" fill="#ffffff" />
                             <path d="M 645 195 A 70 70 0 0 0 645 305" fill="none" stroke="#ffffff" stroke-width="3" stroke-opacity="0.85" />
 
-                            <!-- Corner Arcs -->
-                            <path d="M 30 50 A 20 20 0 0 0 50 30" fill="none" stroke="#ffffff" stroke-width="3" stroke-opacity="0.85" />
-                            <path d="M 30 450 A 20 20 0 0 1 50 470" fill="none" stroke="#ffffff" stroke-width="3" stroke-opacity="0.85" />
-                            <path d="M 770 50 A 20 20 0 0 1 750 30" fill="none" stroke="#ffffff" stroke-width="3" stroke-opacity="0.85" />
-                            <path d="M 770 450 A 20 20 0 0 0 750 470" fill="none" stroke="#ffffff" stroke-width="3" stroke-opacity="0.85" />
-
-                            <!-- Team Color Banners on Pitch -->
                             <g transform="translate(50, 45)">
                                 <rect x="0" y="0" width="140" height="28" rx="6" fill="<?php echo htmlspecialchars($match['home_color']); ?>" fill-opacity="0.9" stroke="#ffffff" stroke-width="1.5"/>
                                 <text x="70" y="19" fill="#ffffff" font-family="'Outfit', sans-serif" font-weight="700" font-size="13" text-anchor="middle">
@@ -202,14 +296,13 @@ function getEventBadge($type) {
                                 </text>
                             </g>
 
-                            <!-- Center Ball Graphic -->
                             <circle cx="400" cy="250" r="14" fill="#ffffff" stroke="#0f172a" stroke-width="2"/>
                             <polygon points="400,240 408,246 405,255 395,255 392,246" fill="#0f172a" />
                         </svg>
                     </div>
                 </section>
 
-                <!-- Chronological Match Event Timeline Feed -->
+                <!-- Chronological Timeline Feed -->
                 <section class="card timeline-section">
                     <div class="card-header">
                         <h2><span class="header-icon">📜</span> Live Timeline Feed</h2>
@@ -220,7 +313,7 @@ function getEventBadge($type) {
                         <?php if (empty($event_logs)): ?>
                             <div class="timeline-empty">
                                 <span class="empty-icon">⚽</span>
-                                <p>No match events logged yet. Match officials can log goals, cards, and subs in real time!</p>
+                                <p>No match events logged yet.</p>
                             </div>
                         <?php else: ?>
                             <ol class="timeline-feed">
@@ -263,8 +356,7 @@ function getEventBadge($type) {
 
     <footer class="site-footer">
         <div class="footer-container">
-            <p>&copy; <?php echo date('Y'); ?> Ashesi Football Association (AFA). All Rights Reserved.</p>
-            <p class="tech-stack">Built with Vanilla PHP, MySQLi, HTML5, CSS3 Grid/Flexbox & JavaScript.</p>
+            <p>&copy; <?php echo date('Y'); ?> Ashesi Football Association (AFA).</p>
         </div>
     </footer>
 

@@ -12,6 +12,7 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 $match_id    = isset($_POST['match_id']) ? intval($_POST['match_id']) : 0;
 $team_id     = isset($_POST['team_id']) ? intval($_POST['team_id']) : 0;
 $minute      = isset($_POST['minute']) ? intval($_POST['minute']) : 0;
+$player_id   = isset($_POST['player_id']) && intval($_POST['player_id']) > 0 ? intval($_POST['player_id']) : null;
 $player_name = isset($_POST['player_name']) ? trim($_POST['player_name']) : '';
 $event_type  = isset($_POST['event_type']) ? trim($_POST['event_type']) : '';
 
@@ -58,22 +59,30 @@ if ($match_res->num_rows === 0) {
 $match_data = $match_res->fetch_assoc();
 $match_stmt->close();
 
-// Verify team is actually playing in this match
+// Verify team is actually participating in this match
 if ($team_id != $match_data['home_team_id'] && $team_id != $match_data['away_team_id']) {
     header("Location: logger.php?error=" . urlencode("Selected team is not a participant in this match."));
     exit;
 }
 
-// Begin transaction for data consistency
+// Transaction
 $conn->begin_transaction();
 
 try {
     // 1. Insert Event Log into event_logs
-    $insert_stmt = $conn->prepare("
-        INSERT INTO event_logs (match_id, team_id, minute, player_name, event_type)
-        VALUES (?, ?, ?, ?, ?)
-    ");
-    $insert_stmt->bind_param("iiiss", $match_id, $team_id, $minute, $player_name, $event_type);
+    if ($player_id !== null) {
+        $insert_stmt = $conn->prepare("
+            INSERT INTO event_logs (match_id, team_id, minute, player_id, player_name, event_type)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ");
+        $insert_stmt->bind_param("iiiiss", $match_id, $team_id, $minute, $player_id, $player_name, $event_type);
+    } else {
+        $insert_stmt = $conn->prepare("
+            INSERT INTO event_logs (match_id, team_id, minute, player_name, event_type)
+            VALUES (?, ?, ?, ?, ?)
+        ");
+        $insert_stmt->bind_param("iiiss", $match_id, $team_id, $minute, $player_name, $event_type);
+    }
     
     if (!$insert_stmt->execute()) {
         throw new Exception("Failed to log event: " . $insert_stmt->error);
@@ -119,11 +128,11 @@ try {
     $conn->commit();
 
     // Redirect to logger with success status
-    header("Location: logger.php?success=1");
+    header("Location: logger.php?match_id=" . $match_id . "&success=1");
     exit;
 
 } catch (Exception $e) {
     $conn->rollback();
-    header("Location: logger.php?error=" . urlencode($e->getMessage()));
+    header("Location: logger.php?match_id=" . $match_id . "&error=" . urlencode($e->getMessage()));
     exit;
 }
